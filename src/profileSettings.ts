@@ -1,4 +1,10 @@
 import * as path from "path";
+import {
+  createScanner,
+  findNodeAtLocation,
+  parseTree,
+  SyntaxKind,
+} from "jsonc-parser";
 
 /**
  * =============================================================================
@@ -46,7 +52,7 @@ import * as path from "path";
  *
  * 依赖关系（Dependencies）:
  *   - path — 路径拼接
- *   无其他外部依赖，纯 TypeScript 实现
+ *   - jsonc-parser — 定位语言设置对象及继承标记注释
  *
  * 被谁使用（Used by）:
  *   - src/profiles.ts — 所有继承逻辑均依赖此模块
@@ -103,6 +109,10 @@ export const INHERITED_SETTINGS_START_MARKER =
   "// --- INHERITED SETTINGS MARKER START --- //";
 export const INHERITED_SETTINGS_END_MARKER =
   "// --- INHERITED SETTINGS MARKER END --- //";
+export const INHERITED_LANGUAGE_SETTINGS_START_MARKER =
+  "// --- INHERITED LANGUAGE SETTINGS MARKER START --- //";
+export const INHERITED_LANGUAGE_SETTINGS_END_MARKER =
+  "// --- INHERITED LANGUAGE SETTINGS MARKER END --- //";
 export const INHERITED_SETTINGS_INSERTION_BOUNDARY_KEY =
   "inheritProfile._insertionBoundary";
 export const INHERITED_SETTINGS_INSERTION_BOUNDARY_VALUE = false;
@@ -138,6 +148,8 @@ export const NON_FLATTENABLE_SETTINGS: ReadonlySet<string> = new Set([
   "files.readonlyExclude",
   "files.associations",
   "search.exclude",
+  "github.copilot.enable",
+  "json.schemaDownload.trustedDomains",
   "workbench.editorAssociations",
   "workbench.colorCustomizations",
   "editor.tokenColorCustomizations",
@@ -165,7 +177,8 @@ export const NON_FLATTENABLE_SETTINGS: ReadonlySet<string> = new Set([
  *
  * Keys that match a known {@link NON_FLATTENABLE_SETTINGS} entry are kept as a
  * single leaf entry, even though their value is an object, since those
- * objects hold data (e.g. glob patterns) rather than nested settings.
+ * objects hold data (e.g. glob patterns) rather than nested settings. Language
+ * selectors retain their setting IDs and values inside the selector object.
  * @param settings Settings to flatten.
  * @param parentKey Parent key from previous iteration.
  * @param result Flattened result to return.
@@ -182,7 +195,8 @@ export function flattenSettings(
       value &&
       typeof value === "object" &&
       !Array.isArray(value) &&
-      !NON_FLATTENABLE_SETTINGS.has(newKey);
+      !NON_FLATTENABLE_SETTINGS.has(newKey) &&
+      !isLanguageOverrideKey(newKey);
     if (isFlattenableObject) {
       flattenSettings(value, newKey, result);
     } else {
@@ -192,9 +206,18 @@ export function flattenSettings(
   return result;
 }
 
+function isSettingsObject(value: any): value is Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function isLanguageOverrideKey(key: string): boolean {
+  return /^(\[[^\]]+\])+$/.test(key);
+}
+
 /**
  * Merges two flattened settings objects into one.
- * Keys from `source` override keys from `target`.
+ * Keys from `source` override keys from `target`. Language selectors merge
+ * their individual settings; each setting value still overrides as a whole.
  *
  * Example:
  * target = { "editor.fontSize": "14", "files.autoSave": "off" }
@@ -205,7 +228,17 @@ export function mergeFlattenedSettings(
   target: Record<string, any>,
   source: Record<string, any>,
 ): Record<string, any> {
-  return { ...target, ...source };
+  const result = { ...target, ...source };
+  for (const [key, value] of Object.entries(source)) {
+    if (
+      isLanguageOverrideKey(key) &&
+      isSettingsObject(value) &&
+      isSettingsObject(target[key])
+    ) {
+      result[key] = { ...target[key], ...value };
+    }
+  }
+  return result;
 }
 
 /**
@@ -220,7 +253,18 @@ export function subtractSettings(
 ): Record<string, any> {
   const result: Record<string, any> = {};
   for (const [key, value] of Object.entries(base)) {
-    if (!(key in toRemove)) {
+    if (
+      isLanguageOverrideKey(key) &&
+      isSettingsObject(value) &&
+      isSettingsObject(toRemove[key])
+    ) {
+      const remaining = Object.fromEntries(
+        Object.entries(value).filter(([setting]) => !(setting in toRemove[key])),
+      );
+      if (Object.keys(remaining).length > 0) {
+        result[key] = remaining;
+      }
+    } else if (!(key in toRemove)) {
       result[key] = value;
     }
   }
@@ -641,8 +685,9 @@ export function stripInheritedSettingsBlocks(raw: string): {
   cleaned: string;
   removedCount: number;
 } {
-  let cleaned = raw;
-  let removedCount = 0;
+  const languageBlocks = stripInheritedLanguageSettingsBlocks(raw);
+  let cleaned = languageBlocks.cleaned;
+  let removedCount = languageBlocks.removedCount;
 
   while (true) {
     const startIndex = cleaned.indexOf(INHERITED_SETTINGS_START_MARKER);
@@ -695,6 +740,58 @@ export function stripInheritedSettingsBlocks(raw: string): {
   }
 
   return { cleaned, removedCount };
+}
+
+/** Removes only generated language entries, preserving surrounding child entries. */
+function stripInheritedLanguageSettingsBlocks(raw: string): {
+  cleaned: string;
+  removedCount: number;
+} {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const scanner = createScanner(raw);
+  let start = -1;
+  let startDepth = 0;
+  let depth = 0;
+  for (let token = scanner.scan(); token !== SyntaxKind.EOF; token = scanner.scan()) {
+    if (token === SyntaxKind.OpenBraceToken) {
+      depth++;
+    } else if (token === SyntaxKind.CloseBraceToken) {
+      if (depth === startDepth) {
+        start = -1;
+      }
+      depth--;
+    } else if (token === SyntaxKind.LineCommentTrivia) {
+      const offset = scanner.getTokenOffset();
+      const end = offset + scanner.getTokenLength();
+      const comment = raw.slice(offset, end).trimEnd();
+      if (comment === INHERITED_LANGUAGE_SETTINGS_START_MARKER) {
+        start = offset;
+        startDepth = depth;
+      } else if (
+        comment === INHERITED_LANGUAGE_SETTINGS_END_MARKER &&
+        start >= 0 && depth === startDepth
+      ) {
+        ranges.push({ start, end });
+        start = -1;
+      }
+    }
+  }
+
+  let cleaned = raw;
+  for (const range of ranges.reverse()) {
+    let before = cleaned.slice(0, range.start);
+    const after = cleaned.slice(range.end);
+    // The comma inserted after the last child entry is no longer needed when
+    // the managed block was the last part of this selector object.
+    if (createScanner(after, true).scan() === SyntaxKind.CloseBraceToken) {
+      const last = getLastMeaningfulCharacterIndex(before);
+      if (before[last] === ",") {
+        before = before.slice(0, last) + before.slice(last + 1);
+      }
+    }
+    cleaned = before + after;
+  }
+  return { cleaned, removedCount: ranges.length };
 }
 
 /**
@@ -1112,6 +1209,41 @@ export function buildInheritedSettingsBlock(
     insertionBoundaryEntry +
     "\n"
   );
+}
+
+/**
+ * Inserts inherited settings into existing language objects. Selectors absent
+ * from the child remain available for the ordinary top-level inherited block.
+ */
+export function insertInheritedLanguageSettings(
+  raw: string,
+  settings: Record<string, any>,
+  tab: string,
+): { raw: string; remaining: Record<string, any> } {
+  const remaining = { ...settings };
+  for (const [selector, value] of Object.entries(settings)) {
+    if (!isLanguageOverrideKey(selector) || !isSettingsObject(value)) {
+      continue;
+    }
+    const tree = parseTree(raw);
+    const node = tree && findNodeAtLocation(tree, [selector]);
+    if (!node || node.type !== "object") {
+      continue;
+    }
+    const lineStart = raw.lastIndexOf("\n", node.offset) + 1;
+    const indent = /^[\t ]*/.exec(raw.slice(lineStart, node.offset))![0];
+    const entryIndent = indent + tab;
+    const entries = Object.entries(value)
+      .map(([key, entry]) => `${entryIndent}${JSON.stringify(key)}: ${JSON.stringify(entry)}`)
+      .join(",\n");
+    const block = `${entryIndent}${INHERITED_LANGUAGE_SETTINGS_START_MARKER}\n` +
+      `${entryIndent}${WARNING_COMMENT}\n${entries}\n` +
+      `${entryIndent}${INHERITED_LANGUAGE_SETTINGS_END_MARKER}\n`;
+    const close = node.offset + node.length - 1;
+    raw = insertBeforeClose(raw.slice(0, close), block) + indent + raw.slice(close);
+    delete remaining[selector];
+  }
+  return { raw, remaining };
 }
 
 /**

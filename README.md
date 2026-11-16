@@ -109,12 +109,19 @@ option:
 First, the extension will read the settings for each of the profiles you have elected to inherit from. It will then flatten each of the settings keys into a single string key and store it alongside its value. As the extension iterates through the different `settings.json` files from each inherited profile, it will override any existing settings with new ones. This is done according to the order that the profiles appear in in the `inheritProfile.parents` setting.
 
 > **Note**: A small set of well-known settings whose value is itself a JSON
-> object — for example `files.exclude`, `search.exclude`, and
-> `workbench.colorCustomizations` — are **not** flattened. The keys inside
+> object — for example `files.exclude`, `github.copilot.enable`,
+> `json.schemaDownload.trustedDomains`, and `workbench.colorCustomizations` —
+> are **not** flattened. The keys inside
 > these objects are user-defined data (glob patterns, colour identifiers,
 > etc.) rather than nested setting names, so flattening them would corrupt
 > the setting. These are instead inherited or overridden as a single, whole
 > value (see [issue #5](https://github.com/luotianyiismywife/inherit-profile-plus/issues/5)).
+
+Language-specific blocks such as `[javascript]` and `[javascript][typescript]` keep
+their bracketed selectors and the setting IDs inside them. When multiple
+parents define the same selector, their settings are combined, with later
+parents overriding matching setting IDs. An object-valued setting inside a
+language block is still overridden as a whole value.
 
 Let's say you have two profiles you want to inherit from:
 
@@ -174,9 +181,13 @@ the extension will subtract the current profile settings from the inherited sett
 
 > **Note**: Since `"one.hello"` was already defined in the current profile, the extension knows not to inherit this from the parent profiles since the current profile takes priority.
 
+The same rule applies to individual settings inside a language block. For
+example, a child's `[javascript]` block defining `editor.defaultFormatter` can still
+inherit `editor.formatOnSave` from the parent's `[javascript]` block.
+
 ### 3: Inserting the Final Inherited Settings
 
-The final inherited settings are then inserted into the current profile between a start and an end marker, alongside a warning comment and an `inheritProfile._insertionBoundary` setting that marks where the inherited block ends. This will result in the final configuration for the profile:
+The final inherited settings are then inserted into the current profile between a start and an end marker, alongside a warning comment and an `inheritProfile._insertionBoundary` setting that marks where the inherited block ends. When the child already has a matching language block, its inherited entries are placed in a separate marked section inside that block, keeping a single object for the selector. For ordinary settings, this results in the following configuration:
 
 ```json
 {
@@ -192,7 +203,7 @@ The final inherited settings are then inserted into the current profile between 
 }
 ```
 
-> **Note**: It is important that the start and end markers, the warning comment, and the `inheritProfile._insertionBoundary` setting are left alone. The extension uses them to identify the inherited settings block, and the dummy setting keeps newly added settings outside the protected section.
+> **Note**: It is important that the start and end markers, the warning comment, and the `inheritProfile._insertionBoundary` setting are left alone. This also applies to the language settings markers inside a language block. The extension uses the markers to identify inherited settings, and the dummy setting keeps newly added top-level settings outside the protected section.
 
 ### 4: Inheriting Extensions
 

@@ -539,6 +539,157 @@ suite("Extension integration", () => {
     );
   });
 
+  test("replaces flattened inherited Copilot and trusted-domain entries with intact maps", async () => {
+    const currentProfile: ProfileDescriptor = {
+      name: "Custom",
+      location: "custom-profile",
+    };
+
+    await writeStorage(sandboxRoot, currentProfile);
+    await writeProfileSettings(
+      sandboxRoot,
+      undefined,
+      JSON.stringify({
+        "github.copilot.enable": { "*": true },
+        "json.schemaDownload.trustedDomains": { "https://aka.ms": true },
+      }),
+    );
+    await writeProfileSettings(
+      sandboxRoot,
+      currentProfile,
+      `{
+    "editor.tabSize": 2,
+    ${INHERITED_SETTINGS_START_MARKER}
+    "github.copilot.enable.*": true,
+    "json.schemaDownload.trustedDomains.https://aka.ms": true,
+    ${INHERITED_SETTINGS_END_MARKER}
+    "${INHERITED_SETTINGS_INSERTION_BOUNDARY_KEY}": false
+}
+`,
+    );
+
+    await updateConfig("parents", ["Default"]);
+    await updateCurrentProfileInheritance(createContext(sandboxRoot));
+
+    const settingsPath = path.join(
+      getProfileDirectory(sandboxRoot, currentProfile),
+      "settings.json",
+    );
+    const updatedSettings = parse(await fs.readFile(settingsPath, "utf8"));
+
+    assert.strictEqual(updatedSettings["editor.tabSize"], 2);
+    assert.deepStrictEqual(updatedSettings["github.copilot.enable"], { "*": true });
+    assert.deepStrictEqual(updatedSettings["json.schemaDownload.trustedDomains"], {
+      "https://aka.ms": true,
+    });
+    assert.strictEqual(updatedSettings["github.copilot.enable.*"], undefined);
+    assert.strictEqual(
+      updatedSettings["json.schemaDownload.trustedDomains.https://aka.ms"],
+      undefined,
+    );
+  });
+
+  test("merges language settings across parents into one existing child selector", async () => {
+    const currentProfile = { name: "Child", location: "child-profile" };
+    const parentProfile = { name: "Parent", location: "parent-profile" };
+    await writeStorage(sandboxRoot, currentProfile, [parentProfile]);
+    await writeProfileSettings(sandboxRoot, undefined, JSON.stringify({
+      "[javascript]": {
+        "editor.formatOnSave": false,
+        "editor.defaultFormatter": "first.formatter",
+        "editor.rulers": [80],
+        "editor.codeActionsOnSave": { "source.organizeImports": "explicit" },
+      },
+      "[javascript][typescript]": { "editor.tabSize": 2 },
+    }));
+    await writeProfileSettings(sandboxRoot, parentProfile, JSON.stringify({
+      "[javascript]": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "vscode.typescript-language-features",
+        "editor.codeActionsOnSave": { "source.fixAll.eslint": "explicit" },
+      },
+    }));
+    await writeProfileSettings(sandboxRoot, currentProfile, `{
+    "[javascript]": {
+        // Keep the child's formatter.
+        "editor.defaultFormatter": "child.formatter",
+        "editor.tabSize": 4
+    }
+}\n`);
+
+    await updateConfig("parents", ["Default", "Parent"]);
+    await updateCurrentProfileInheritance(createContext(sandboxRoot));
+
+    const raw = await fs.readFile(path.join(
+      getProfileDirectory(sandboxRoot, currentProfile), "settings.json",
+    ), "utf8");
+    const settings = parse(raw);
+    assert.deepStrictEqual(settings["[javascript]"], {
+      "editor.defaultFormatter": "child.formatter",
+      "editor.tabSize": 4,
+      "editor.formatOnSave": true,
+      "editor.rulers": [80],
+      "editor.codeActionsOnSave": { "source.fixAll.eslint": "explicit" },
+    });
+    assert.deepStrictEqual(settings["[javascript][typescript]"], { "editor.tabSize": 2 });
+    assert.strictEqual((raw.match(/"\[javascript\]"\s*:/g) ?? []).length, 1);
+    assert.ok(raw.includes("// Keep the child's formatter."));
+    assert.ok(!Object.keys(settings).some((key) => key.startsWith("[javascript].")));
+  });
+
+  test("refreshes and removes inherited language entries without losing child settings", async () => {
+    const currentProfile = { name: "Child", location: "child-profile" };
+    await writeStorage(sandboxRoot, currentProfile);
+    await writeProfileSettings(sandboxRoot, undefined, JSON.stringify({
+      "[javascript]": {
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": { "source.fixAll": "explicit" },
+      },
+    }));
+    await writeProfileSettings(sandboxRoot, currentProfile, `{
+    "[javascript]": {
+        // Child setting stays here.
+        "editor.tabSize": 4
+    },
+    "files.autoSave": "off"
+}
+// Profile footer stays here.\n`);
+    await updateConfig("parents", ["Default"]);
+    const context = createContext(sandboxRoot);
+    const settingsPath = path.join(
+      getProfileDirectory(sandboxRoot, currentProfile), "settings.json",
+    );
+
+    await updateCurrentProfileInheritance(context);
+    const first = await fs.readFile(settingsPath, "utf8");
+    assert.strictEqual(parse(first)["[javascript]"]["editor.formatOnSave"], true);
+    await updateCurrentProfileInheritance(context);
+    assert.strictEqual(await fs.readFile(settingsPath, "utf8"), first);
+
+    await writeProfileSettings(sandboxRoot, undefined, JSON.stringify({
+      "[javascript]": { "editor.formatOnSave": false },
+    }));
+    await updateCurrentProfileInheritance(context);
+    assert.deepStrictEqual(parse(await fs.readFile(settingsPath, "utf8"))["[javascript]"], {
+      "editor.tabSize": 4,
+      "editor.formatOnSave": false,
+    });
+
+    await removeCurrentProfileInheritedSettings(context);
+    const removed = await fs.readFile(settingsPath, "utf8");
+    assert.deepStrictEqual(parse(removed)["[javascript]"], { "editor.tabSize": 4 });
+    assert.strictEqual(parse(removed)["files.autoSave"], "off");
+    assert.ok(removed.includes("// Child setting stays here."));
+    assert.ok(removed.includes("// Profile footer stays here."));
+
+    await updateCurrentProfileInheritance(context);
+    await writeProfileSettings(sandboxRoot, undefined, "{}");
+    await updateCurrentProfileInheritance(context);
+    assert.deepStrictEqual(parse(await fs.readFile(settingsPath, "utf8"))["[javascript]"], {
+      "editor.tabSize": 4,
+    });
+  });
+
   test("does not inherit extensions when inheritExtensions is disabled", async () => {
     const currentProfile: ProfileDescriptor = {
       name: "Custom",

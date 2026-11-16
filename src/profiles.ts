@@ -100,7 +100,10 @@ import {
   flattenSettings,
   INHERITED_SETTINGS_END_MARKER,
   INHERITED_SETTINGS_START_MARKER,
+  INHERITED_LANGUAGE_SETTINGS_START_MARKER,
+  INHERITED_LANGUAGE_SETTINGS_END_MARKER,
   insertBeforeClose,
+  insertInheritedLanguageSettings,
   isBalancedJsonc,
   isSettingsDocument,
   mergeFlattenedSettings,
@@ -1017,7 +1020,9 @@ async function getInheritedSettings(
 function hasInheritedMarkers(raw: string): boolean {
   return (
     raw.includes(INHERITED_SETTINGS_START_MARKER) ||
-    raw.includes(INHERITED_SETTINGS_END_MARKER)
+    raw.includes(INHERITED_SETTINGS_END_MARKER) ||
+    raw.includes(INHERITED_LANGUAGE_SETTINGS_START_MARKER) ||
+    raw.includes(INHERITED_LANGUAGE_SETTINGS_END_MARKER)
   );
 }
 
@@ -1126,10 +1131,7 @@ async function removeInheritedSettingsFromFile(
     // 区分"文件里根本没有标记"（正常早退）与"有标记却一个都没删掉"
     // （未识别的损坏形态，例如只有 START 没有 END 的孤儿 START）——后者
     // 必须告警，而不是静默返回，否则问题会被无声吞掉。
-    if (
-      raw.includes(INHERITED_SETTINGS_START_MARKER) ||
-      raw.includes(INHERITED_SETTINGS_END_MARKER)
-    ) {
+    if (hasInheritedMarkers(raw)) {
       console.warn(
         `[settings-consistency] Found inherited settings markers in ` +
           `\`${settingsPath}\` but removed none; the file may be in an ` +
@@ -1140,8 +1142,8 @@ async function removeInheritedSettingsFromFile(
   }
 
   // Ensure JSONC ends properly:
-  let cleaned = removeTrailingComma(stripped);
-  if (!cleaned.endsWith("}")) {
+  let cleaned = removeTrailingComma(stripped).trimEnd();
+  if (!cleaned.endsWith("}") && !isSettingsDocument(cleaned)) {
     cleaned += "\n}";
   }
 
@@ -1214,16 +1216,18 @@ async function writeInheritedSettings(
     );
     return;
   }
-  const [beforeClose, afterClose] = split;
   const tab = findTabValue(raw);
-
-  // Build the inherited settings block:
-  const block = buildInheritedSettingsBlock(flattened, tab);
-
-  // Insert the inherited settings block between the before and after closing
-  // brace blocks:
-  const beforeClosePlusBlock = insertBeforeClose(beforeClose, block);
-  const finalSettings = beforeClosePlusBlock + afterClose;
+  const languageSettings = insertInheritedLanguageSettings(raw, flattened, tab);
+  let finalSettings = languageSettings.raw;
+  if (Object.keys(languageSettings.remaining).length > 0) {
+    const updatedSplit = splitRawSettingsByClosingBrace(finalSettings);
+    if (!updatedSplit) {
+      return;
+    }
+    const [beforeClose, afterClose] = updatedSplit;
+    const block = buildInheritedSettingsBlock(languageSettings.remaining, tab);
+    finalSettings = insertBeforeClose(beforeClose, block) + afterClose;
+  }
 
   // Final structural sanity check before writing: never write a file that
   // doesn't round-trip as a balanced settings OBJECT (guards against edge

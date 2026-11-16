@@ -1,5 +1,6 @@
 import * as assert from "assert";
 import * as path from "path";
+import { parse, type ParseError } from "jsonc-parser";
 
 import {
   buildInheritedSettingsBlock,
@@ -10,6 +11,9 @@ import {
   INHERITED_SETTINGS_INSERTION_BOUNDARY_KEY,
   INHERITED_SETTINGS_START_MARKER,
   insertBeforeClose,
+  insertInheritedLanguageSettings,
+  INHERITED_LANGUAGE_SETTINGS_START_MARKER,
+  INHERITED_LANGUAGE_SETTINGS_END_MARKER,
   mergeFlattenedSettings,
   mergeInheritedExtensions,
   NON_FLATTENABLE_SETTINGS,
@@ -81,6 +85,83 @@ suite("profileSettings helpers", () => {
         },
         "files.autoSave": "off",
       },
+    );
+  });
+
+  test("flattenSettings preserves the Copilot enable map in dotted and grouped settings", () => {
+    const value = { "*": true, markdown: false };
+    const expected = { "github.copilot.enable": value };
+
+    assert.deepStrictEqual(flattenSettings(expected), expected);
+    assert.deepStrictEqual(
+      flattenSettings({ github: { copilot: { enable: value } } }),
+      expected,
+    );
+  });
+
+  test("flattenSettings preserves literal URLs in the JSON schema trusted-domain map", () => {
+    const value = { "https://aka.ms": true };
+    const expected = { "json.schemaDownload.trustedDomains": value };
+
+    assert.deepStrictEqual(flattenSettings(expected), expected);
+    assert.deepStrictEqual(
+      flattenSettings({ json: { schemaDownload: { trustedDomains: value } } }),
+      expected,
+    );
+  });
+
+  test("flattenSettings preserves language selectors and their object-valued settings", () => {
+    const settings = {
+      "[javascript]": { "editor.defaultFormatter": "vscode.typescript-language-features" },
+      "[javascript][typescript]": {
+        "editor.codeActionsOnSave": { "source.fixAll.eslint": "explicit" },
+      },
+    };
+
+    assert.deepStrictEqual(flattenSettings(settings), settings);
+  });
+
+  test("mergeFlattenedSettings merges language settings while replacing individual object values", () => {
+    assert.deepStrictEqual(
+      mergeFlattenedSettings(
+        {
+          "[javascript]": {
+            "editor.formatOnSave": true,
+            "editor.defaultFormatter": "first.formatter",
+            "editor.codeActionsOnSave": { "source.organizeImports": "explicit" },
+          },
+        },
+        {
+          "[javascript]": {
+            "editor.defaultFormatter": "second.formatter",
+            "editor.codeActionsOnSave": { "source.fixAll": "explicit" },
+          },
+        },
+      ),
+      {
+        "[javascript]": {
+          "editor.formatOnSave": true,
+          "editor.defaultFormatter": "second.formatter",
+          "editor.codeActionsOnSave": { "source.fixAll": "explicit" },
+        },
+      },
+    );
+  });
+
+  test("subtractSettings removes child settings within the same language selector", () => {
+    const parent = {
+      "[javascript]": {
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": { "source.fixAll": "explicit" },
+      },
+      "[javascript][typescript]": { "editor.tabSize": 2 },
+    };
+    assert.deepStrictEqual(
+      subtractSettings(parent, {
+        "[javascript]": { "editor.codeActionsOnSave": {} },
+        "[javascript][typescript]": { "editor.tabSize": 4 },
+      }),
+      { "[javascript]": { "editor.formatOnSave": true } },
     );
   });
 
@@ -298,6 +379,51 @@ ${block}${block}}
     "own.setting": true
 }
 `);
+  });
+
+  test("language block insertion and removal preserve child entries and comments in multiple selectors", () => {
+    const raw = `{
+  "[javascript]": {
+    // Keep this setting.
+    "editor.tabSize": 4
+  },
+  "[javascript][typescript]": {},
+  "example.markerText": ${JSON.stringify(INHERITED_LANGUAGE_SETTINGS_START_MARKER)}
+}
+// Keep this footer.
+`;
+    const inserted = insertInheritedLanguageSettings(raw, {
+      "[javascript]": { "editor.formatOnSave": true },
+      "[javascript][typescript]": { "editor.tabSize": 2 },
+    }, "  ");
+    assert.deepStrictEqual(inserted.remaining, {});
+    assert.strictEqual(parse(inserted.raw)["[javascript]"]["editor.formatOnSave"], true);
+
+    const { cleaned, removedCount } = stripInheritedSettingsBlocks(inserted.raw);
+    const errors: ParseError[] = [];
+    assert.deepStrictEqual(parse(cleaned, errors, { allowTrailingComma: false }), parse(raw));
+    assert.deepStrictEqual(errors, []);
+    assert.strictEqual(removedCount, 2);
+    assert.ok(cleaned.includes("// Keep this setting."));
+    assert.ok(cleaned.includes("// Keep this footer."));
+  });
+
+  test("language block removal preserves child settings added after the inherited entries", () => {
+    const raw = `{
+  "[javascript]": {
+    "editor.tabSize": 4,
+    ${INHERITED_LANGUAGE_SETTINGS_START_MARKER}
+    "editor.formatOnSave": true,
+    ${INHERITED_LANGUAGE_SETTINGS_END_MARKER}
+    "editor.insertSpaces": true
+  }
+}`;
+    const { cleaned } = stripInheritedSettingsBlocks(raw);
+    const errors: ParseError[] = [];
+    assert.deepStrictEqual(parse(cleaned, errors, { allowTrailingComma: false }), {
+      "[javascript]": { "editor.tabSize": 4, "editor.insertSpaces": true },
+    });
+    assert.deepStrictEqual(errors, []);
   });
 
   test("stripInheritedSettingsBlocks removes an out-of-object residual block without leaving a duplicate top-level brace", () => {
